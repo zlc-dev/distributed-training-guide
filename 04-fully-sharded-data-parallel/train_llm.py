@@ -84,21 +84,16 @@ def main():
     fsdp_config = dict(
         reshard_after_forward=True,
         offload_policy=CPUOffloadPolicy() if args.cpu_offload else None,
-        mp_policy=MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=torch.float32),
+        mp_policy=MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=dtype),
     )
 
-    if hasattr(model, "model") and hasattr(model.model, "layers"):
-        layers = model.model.layers
-    elif hasattr(model, "transformer") and hasattr(model.transformer, "h"):
-        layers = model.transformer.h
-    else:
-        raise ValueError(f"Unknown model structure for FSDP sharding: {type(model)}")
+    layers = model.model.layers
 
     for decoder in layers:
         fully_shard(decoder, **fsdp_config)
     fully_shard(model, **fsdp_config)
 
-    num_to_forward_prefetch = 2
+    num_to_forward_prefetch = 1
     for i, layer in enumerate(layers):
         if i >= len(layers) - num_to_forward_prefetch:
             break
@@ -107,7 +102,7 @@ def main():
         ]
         layer.set_modules_to_forward_prefetch(layers_to_prefetch)
 
-    num_to_backward_prefetch = 2
+    num_to_backward_prefetch = 1
     for i, layer in enumerate(layers):
         if i < num_to_backward_prefetch:
             continue
@@ -209,7 +204,8 @@ def main():
         schedule=torch.profiler.schedule(wait=5, warmup=2, active=3, repeat=1),
         on_trace_ready=torch.profiler.tensorboard_trace_handler(str(exp_dir / "log")),
         record_shapes=True,
-        with_stack=True
+        with_stack=True,
+        profile_memory=True
     ) if enable_profiler else contextlib.nullcontext() as prof:
         for state["epoch"] in range(state["epoch"], args.num_epochs):
             LOGGER.info(f"Begin epoch {state['epoch']} at step {state['epoch_step']}")
@@ -233,24 +229,24 @@ def main():
                     # NOTE: for resuming
                     continue
 
-                with timers["forward"]:
+                with timers["forward"], torch.profiler.record_function("FSDP_Forward"):
                     outputs = model(**batch)
                     del batch
 
-                with timers["backward"]:
+                with timers["backward"], torch.profiler.record_function("FSDP_Backward"):
                     outputs.loss.backward()
 
-                with timers["update"]:
+                with timers["update"], torch.profiler.record_function("FSDP_Update"):
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=not args.cpu_offload)
+
+                prof.step()
 
                 state["global_step"] += 1
                 state["epoch_step"] += 1
                 state["running_loss"] += outputs.loss.item()
                 progress_bar.update(1)
-
-                prof.step()
 
                 if state["global_step"] % args.log_freq == 0:
                     tok_per_step = world_size * args.batch_size * args.seq_length
