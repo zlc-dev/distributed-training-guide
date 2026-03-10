@@ -86,9 +86,35 @@ def main():
         offload_policy=CPUOffloadPolicy() if args.cpu_offload else None,
         mp_policy=MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=torch.float32),
     )
-    for decoder in model.model.layers:
+
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        layers = model.model.layers
+    elif hasattr(model, "transformer") and hasattr(model.transformer, "h"):
+        layers = model.transformer.h
+    else:
+        raise ValueError(f"Unknown model structure for FSDP sharding: {type(model)}")
+
+    for decoder in layers:
         fully_shard(decoder, **fsdp_config)
     fully_shard(model, **fsdp_config)
+
+    num_to_forward_prefetch = 2
+    for i, layer in enumerate(layers):
+        if i >= len(layers) - num_to_forward_prefetch:
+            break
+        layers_to_prefetch = [
+            layers[i + j] for j in range(1, num_to_forward_prefetch + 1)
+        ]
+        layer.set_modules_to_forward_prefetch(layers_to_prefetch)
+
+    num_to_backward_prefetch = 2
+    for i, layer in enumerate(layers):
+        if i < num_to_backward_prefetch:
+            continue
+        layers_to_prefetch = [
+            layers[i - j] for j in range(1, num_to_backward_prefetch + 1)
+        ]
+        layer.set_modules_to_backward_prefetch(layers_to_prefetch)
 
     model.to_empty(device="cpu" if args.cpu_offload else device)
     model.apply(
